@@ -1,0 +1,20 @@
+# Compiled binary
+modio-api-go
+*.exe
+
+# Test binary
+*.test
+
+# Coverage output
+*.out
+
+# Environment file
+.env
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE specific
+.vscode/
+.idea/

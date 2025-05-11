@@ -1,0 +1,19 @@
+# Git files
+.git
+.gitignore
+
+# Local .env file (secrets should be passed as env vars to container, not baked in)
+.env 
+
+# Go build cache (if any local builds produce it outside target)
+# bin/
+# pkg/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# The Dockerfile itself
+Dockerfile
