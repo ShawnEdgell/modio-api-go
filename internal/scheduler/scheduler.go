@@ -3,32 +3,31 @@ package scheduler
 
 import (
 	"log/slog"
+	"sync" // Import sync package for Mutex
 	"time"
 
-	// Adjust import paths based on your go.mod module path
 	"github.com/ShawnEdgell/modio-api-go/internal/cache"
 	"github.com/ShawnEdgell/modio-api-go/internal/config"
 	"github.com/ShawnEdgell/modio-api-go/internal/modio"
 )
 
 const (
-	// These could also be moved to config if you want them more dynamic,
-	// but for now, matching your TypeScript logic.
-	mapPageCount    = 12
-	scriptPageCount = 5
-	mapTag          = "Map"    // Consistent with your modio.Client logic if it expects these exact strings
-	scriptModTag    = "Script" // Consistent with your modio.Client logic
+	mapPageCountSafeguard    = 25
+	scriptPageCountSafeguard = 15
+	mapTag                   = "Map"
+	scriptModTag             = "Script"
+	lightweightCheckPageSize = 5 // How many items to fetch for the first page check
 )
 
-// Scheduler manages periodic updates of the data cache.
 type Scheduler struct {
-	modioClient *modio.Client
-	cacheStore  *cache.Store
-	cfg         *config.AppConfig
-	stopChan    chan struct{} // Channel to signal stopping the scheduler
+	modioClient  *modio.Client
+	cacheStore   *cache.Store
+	cfg          *config.AppConfig
+	stopChan     chan struct{}
+	updateMu     sync.Mutex // Mutex to prevent concurrent full updates
+	isUpdating   bool       // Flag to indicate if a full update is in progress
 }
 
-// NewScheduler creates a new scheduler instance.
 func NewScheduler(client *modio.Client, store *cache.Store, cfg *config.AppConfig) *Scheduler {
 	return &Scheduler{
 		modioClient: client,
@@ -38,91 +37,152 @@ func NewScheduler(client *modio.Client, store *cache.Store, cfg *config.AppConfi
 	}
 }
 
-// runUpdate performs a single cycle of fetching data from Mod.io and updating the cache.
-func (s *Scheduler) runUpdate() {
-	slog.Info("Scheduler: Starting data refresh cycle from Mod.io...")
+// runUpdate performs a full data refresh
+func (s *Scheduler) runUpdate(triggeredBy string) {
+	if !s.updateMu.TryLock() {
+		slog.Info("Scheduler: Full update already in progress, skipping new trigger.", "triggered_by", triggeredBy)
+		return
+	}
+	s.isUpdating = true
+	defer func() {
+		s.isUpdating = false
+		s.updateMu.Unlock()
+	}()
 
-	var allMaps, allScripts []modio.Mod
+	slog.Info("Scheduler: Starting data refresh cycle.", "triggered_by", triggeredBy)
+
+	var fetchedMaps, fetchedScripts []modio.Mod
 	var errMaps, errScripts error
 
-	// Fetch maps
-	slog.Info("Scheduler: Fetching maps...")
-	allMaps, errMaps = s.modioClient.FetchAllItems(mapTag, mapPageCount)
+	slog.Info("Scheduler: Fetching maps...", "safeguard_max_pages", mapPageCountSafeguard)
+	fetchedMaps, errMaps = s.modioClient.FetchAllItems(mapTag, mapPageCountSafeguard)
 	if errMaps != nil {
 		slog.Error("Scheduler: Failed to fetch maps from Mod.io", "error", errMaps)
-		// Decide on strategy: continue with potentially stale map data, or don't update maps?
-		// For now, if there's an error, we won't update this part of the cache.
-		// You could also load previously persisted data here if you implement file caching.
-		allMaps = nil // Ensure we don't update with partial/error data if that's the policy
 	} else {
-		slog.Info("Scheduler: Successfully fetched maps", "count", len(allMaps))
+		slog.Info("Scheduler: Successfully fetched maps", "count", len(fetchedMaps))
 	}
 
-	// Fetch script mods
-	slog.Info("Scheduler: Fetching script mods...")
-	allScripts, errScripts = s.modioClient.FetchAllItems(scriptModTag, scriptPageCount)
+	slog.Info("Scheduler: Fetching script mods...", "safeguard_max_pages", scriptPageCountSafeguard)
+	fetchedScripts, errScripts = s.modioClient.FetchAllItems(scriptModTag, scriptPageCountSafeguard)
 	if errScripts != nil {
 		slog.Error("Scheduler: Failed to fetch script mods from Mod.io", "error", errScripts)
-		allScripts = nil
 	} else {
-		slog.Info("Scheduler: Successfully fetched script mods", "count", len(allScripts))
+		slog.Info("Scheduler: Successfully fetched script mods", "count", len(fetchedScripts))
 	}
-
-	// Only update the cache if at least one fetch was successful, or decide on a different strategy.
-	// For this example, we update with whatever was fetched (nil if errored).
-	// Your cache.Update method should ideally handle nil slices gracefully if needed,
-	// or this function should ensure it only passes valid data.
-	// Let's assume cache.Update can handle being passed nil for one type if the other succeeded.
-	// Or better, only update with non-nil slices.
 
 	currentMaps, _ := s.cacheStore.GetMaps()
 	currentScripts, _ := s.cacheStore.GetScripts()
+	mapsToStore := currentMaps
+	scriptsToStore := currentScripts
 
-	if errMaps == nil { // If map fetch succeeded
-		slog.Info("Scheduler: Updating maps in cache.")
-		currentMaps = allMaps
+	if errMaps == nil {
+		slog.Info("Scheduler: Staging fetched maps for cache update.")
+		mapsToStore = fetchedMaps
 	} else {
-		slog.Warn("Scheduler: Maps fetch failed, keeping existing maps in cache (if any).")
+		slog.Warn("Scheduler: Maps fetch failed, keeping existing maps in cache.")
 	}
 
-	if errScripts == nil { // If script fetch succeeded
-		slog.Info("Scheduler: Updating scripts in cache.")
-		currentScripts = allScripts
+	if errScripts == nil {
+		slog.Info("Scheduler: Staging fetched scripts for cache update.")
+		scriptsToStore = fetchedScripts
 	} else {
-		slog.Warn("Scheduler: Scripts fetch failed, keeping existing scripts in cache (if any).")
+		slog.Warn("Scheduler: Scripts fetch failed, keeping existing scripts in cache.")
 	}
-	
-	s.cacheStore.Update(currentMaps, currentScripts) // Update with new or existing data
-	slog.Info("Scheduler: Data refresh cycle complete.", "last_updated", s.cacheStore.LastUpdated)
+
+	s.cacheStore.Update(mapsToStore, scriptsToStore)
+	slog.Info("Scheduler: Data refresh cycle complete.", "triggered_by", triggeredBy, "last_updated", s.cacheStore.LastUpdated.Format(time.RFC3339))
 }
 
-// Start begins the cache update scheduler.
-// It performs an initial update and then updates periodically.
+// runLightweightCheck fetches the first page of items and triggers a full update if changes are detected.
+func (s *Scheduler) runLightweightCheck() {
+	if s.isUpdating { // Don't start a lightweight check if a full update is already running
+		slog.Info("Scheduler: Full update in progress, skipping lightweight check.")
+		return
+	}
+	slog.Info("Scheduler: Performing lightweight check for new Mod.io items...")
+
+	needsMapUpdate := false
+	needsScriptUpdate := false
+
+	// Check Maps
+	currentMaps, _ := s.cacheStore.GetMaps()
+	newTopMapsPage, err := s.modioClient.FetchAllItems(mapTag, 1) // Fetch only first page (FetchAllItems will stop after 1 page if maxPagesToFetch is 1)
+                                                                // Or more directly: s.modioClient.fetchPage(mapTag, lightweightCheckPageSize, 0)
+	if err != nil {
+		slog.Error("Scheduler (Lightweight): Failed to fetch first page of maps", "error", err)
+	} else if len(newTopMapsPage) > 0 {
+		if len(currentMaps) == 0 || // If cache is empty
+			currentMaps[0].ID != newTopMapsPage[0].ID || // If top item ID changed
+			currentMaps[0].DateUpdated < newTopMapsPage[0].DateUpdated { // If top item is newer
+			slog.Info("Scheduler (Lightweight): Change detected in maps. Triggering full map update.")
+			needsMapUpdate = true
+		}
+	}
+
+	// Check Scripts
+	currentScripts, _ := s.cacheStore.GetScripts()
+	newTopScriptsPage, err := s.modioClient.FetchAllItems(scriptModTag, 1) // Fetch only first page
+	if err != nil {
+		slog.Error("Scheduler (Lightweight): Failed to fetch first page of scripts", "error", err)
+	} else if len(newTopScriptsPage) > 0 {
+		if len(currentScripts) == 0 || // If cache is empty
+			currentScripts[0].ID != newTopScriptsPage[0].ID || // If top item ID changed
+			currentScripts[0].DateUpdated < newTopScriptsPage[0].DateUpdated { // If top item is newer
+			slog.Info("Scheduler (Lightweight): Change detected in scripts. Triggering full script update.")
+			needsScriptUpdate = true
+		}
+	}
+
+	if needsMapUpdate || needsScriptUpdate {
+		// Call runUpdate in a new goroutine to avoid blocking the lightweight check ticker,
+		// and runUpdate now has its own lock to prevent concurrent full updates.
+		go s.runUpdate("triggered_by_lightweight_check")
+	} else {
+		slog.Info("Scheduler (Lightweight): No significant changes detected on first pages.")
+	}
+}
+
 func (s *Scheduler) Start() {
-	slog.Info("Starting Mod.io data scheduler...", "refresh_interval", s.cfg.CacheRefreshInterval.String())
+	slog.Info("Starting Mod.io data scheduler...",
+		"full_refresh_interval", s.cfg.CacheRefreshInterval.String(),
+		"lightweight_check_interval", s.cfg.LightweightCheckInterval.String(),
+	)
 
-	// Perform an initial update immediately in a goroutine so it doesn't block startup.
-	go s.runUpdate()
+	// Perform an initial full update immediately
+	go func() {
+		slog.Info("Scheduler: Performing initial data load.")
+		s.runUpdate("initial_startup")
+	}()
 
-	// Start the ticker for periodic updates.
-	ticker := time.NewTicker(s.cfg.CacheRefreshInterval)
+	fullRefreshTicker := time.NewTicker(s.cfg.CacheRefreshInterval)
+	lightweightCheckTicker := time.NewTicker(s.cfg.LightweightCheckInterval)
 
 	go func() {
+		defer fullRefreshTicker.Stop()
+		defer lightweightCheckTicker.Stop()
 		for {
 			select {
-			case <-ticker.C:
-				s.runUpdate()
-			case <-s.stopChan: // Listen for a stop signal
-				ticker.Stop()
-				slog.Info("Scheduler: Stopped.")
+			case <-fullRefreshTicker.C:
+				slog.Info("Scheduler: Full refresh tick received.")
+				s.runUpdate("scheduled_full_refresh")
+			case <-lightweightCheckTicker.C:
+				slog.Info("Scheduler: Lightweight check tick received.")
+				s.runLightweightCheck()
+			case <-s.stopChan:
+				slog.Info("Scheduler: Stop signal received, stopping all tickers.")
 				return
 			}
 		}
 	}()
 }
 
-// Stop gracefully stops the scheduler.
 func (s *Scheduler) Stop() {
-	slog.Info("Scheduler: Sending stop signal...")
-	close(s.stopChan) // Close the channel to signal the goroutine to stop
+	slog.Info("Scheduler: Attempting to stop scheduler...")
+	select {
+	case <-s.stopChan:
+		slog.Warn("Scheduler: Stop channel already closed or stop initiated.")
+	default:
+		close(s.stopChan)
+		slog.Info("Scheduler: Stop signal sent.")
+	}
 }
