@@ -9,22 +9,18 @@ COPY go.sum ./
 RUN go mod download
 
 # Copy the rest of your application source code
-# This assumes your internal packages are subdirectories of where main.go is,
-# or that your main.go is in the root of the module.
 COPY . .
 
 # Build the Go application, naming the binary 'modio-api-app'
 RUN CGO_ENABLED=0 GOOS=linux go build -v -o /modio-api-app . 
-# The trailing '.' means build the package in the current directory (WORKDIR /app)
 
 # Stage 2: Create a minimal final image from alpine
 FROM alpine:latest
 WORKDIR /app/
 
 # Add ca-certificates for making HTTPS calls from within the app if necessary
-# (though your Mod.io client already does this from the builder stage if it uses stdlib http)
-# It's generally good practice for any app that might make external calls.
-RUN apk --no-cache add ca-certificates
+# AND add curl for the healthcheck command
+RUN apk --no-cache add ca-certificates curl
 
 # Copy only the compiled application binary from the builder stage
 COPY --from=builder /modio-api-app .
