@@ -1,30 +1,47 @@
-// main.go
 package main
 
 import (
-	// For graceful shutdown
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal" // For graceful shutdown
-	"syscall"   // For graceful shutdown
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/joho/godotenv" // For loading .env file for local development
-
-	// Adjust import paths according to your go.mod module name
-	"github.com/ShawnEdgell/modio-api-go/internal/cache"
 	"github.com/ShawnEdgell/modio-api-go/internal/config"
 	"github.com/ShawnEdgell/modio-api-go/internal/modio"
+	"github.com/ShawnEdgell/modio-api-go/internal/repository"
 	"github.com/ShawnEdgell/modio-api-go/internal/scheduler"
 	"github.com/ShawnEdgell/modio-api-go/internal/server"
+	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
+var rdb *redis.Client
+
+func initRedis(cfg *config.AppConfig) (*redis.Client, error) {
+	slog.Info("Initializing Redis client", "address", cfg.RedisAddr, "db", cfg.RedisDB)
+	rdbInstance := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       cfg.RedisDB,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := rdbInstance.Ping(ctx).Result(); err != nil {
+		slog.Error("Failed to connect to Redis", "error", err)
+		return nil, err
+	}
+	slog.Info("Successfully connected to Redis")
+	return rdbInstance, nil
+}
+
 func main() {
-	// --- Logger Setup ---
-	// (You can keep this as is, or adjust Level for production vs. dev)
-	var loggerHandler slog.Handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug, // Consider slog.LevelInfo for production
+	loggerHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo, // Use LevelInfo for production, LevelDebug for development
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				a.Key = "timestamp"
@@ -33,69 +50,91 @@ func main() {
 			return a
 		},
 	})
-	logger := slog.New(loggerHandler)
-	slog.SetDefault(logger)
+	slog.SetDefault(slog.New(loggerHandler))
 
-	// --- Load .env for local development ---
-	// In production on VPS, Docker Compose will set environment variables from the VPS's .env file.
-	if err := godotenv.Load(); err != nil {
-		slog.Info("No .env file found or error loading, relying on system environment variables or defaults.")
+	if os.Getenv("APP_ENV") != "production" {
+		if err := godotenv.Load(); err != nil {
+			slog.Info("No .env file found or error loading, relying on system environment variables or defaults.")
+		}
 	}
 
-	// --- Load Configuration ---
-	appConfig := config.Load() // This uses the version that Fatals if MODIO_API_KEY is missing
+	appConfig := config.Load()
 
-	// --- Initialize Mod.io Client ---
 	modioClient, err := modio.NewClient(appConfig)
 	if err != nil {
-		slog.Error("Failed to create Mod.io client. Ensure MODIO_API_KEY is set.", "error", err)
-		os.Exit(1) // Exit if client can't be created (API key is essential)
+		slog.Error("Failed to create Mod.io client", "error", err)
+		os.Exit(1)
 	}
 
-	// --- Initialize Cache ---
-	slog.Info("Initializing in-memory cache store...")
-	cacheStore := cache.NewStore()
+	rdb, err = initRedis(appConfig)
+	if err != nil {
+		slog.Error("Failed to initialize Redis", "error", err)
+		os.Exit(1)
+	}
 
-	// --- Initialize and Start Scheduler ---
-	// The scheduler will perform an initial data load and then periodic updates.
-	slog.Info("Initializing data scheduler...")
-	dataScheduler := scheduler.NewScheduler(modioClient, cacheStore, appConfig)
-	dataScheduler.Start() // Runs data fetching in background goroutines
+	slog.Info("Initializing Mod Repository")
+	modRepo := repository.NewModRepository(rdb)
 
-	// --- Create a channel to listen for OS signals for graceful shutdown ---
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	slog.Info("Initializing data scheduler")
+	dataScheduler := scheduler.NewScheduler(modioClient, modRepo, appConfig)
+	dataScheduler.Start()
 
-	// --- Start HTTP Server in a Goroutine ---
-	// This allows the shutdown logic below to run.
-	var serverErr error
+	stopOsSignal := make(chan os.Signal, 1)
+	signal.Notify(stopOsSignal, syscall.SIGINT, syscall.SIGTERM)
+
+	serverErrChan := make(chan error, 1)
 	go func() {
-		slog.Info("Starting HTTP server for Mod.io API Cache...", "port", appConfig.ServerPort)
-		if err := server.Run(appConfig, cacheStore); err != nil && err != http.ErrServerClosed {
-			slog.Error("HTTP server failed", "error", err)
-			serverErr = err // Capture error to potentially exit main goroutine
-			stop <- syscall.SIGINT // Trigger shutdown on server error
+		slog.Info("Starting HTTP server", "port", appConfig.ServerPort)
+		if err := server.Run(appConfig, modRepo); err != nil && err != http.ErrServerClosed {
+			slog.Error("HTTP server error", "error", err)
+			serverErrChan <- err
+		} else if err == http.ErrServerClosed {
+			slog.Info("HTTP server closed")
+			close(serverErrChan)
+		} else {
+			slog.Info("HTTP server stopped gracefully")
+			close(serverErrChan)
 		}
 	}()
 
-	// --- Wait for a shutdown signal ---
-	<-stop // Block here until a signal is received
+	var serverErr error
+	select {
+	case sig := <-stopOsSignal:
+		slog.Info("OS signal received, initiating shutdown", "signal", sig.String())
+		// server.Run has its own signal handler that should initiate srv.Shutdown()
+		// Main will proceed to shut down other components.
+	case err, ok := <-serverErrChan:
+		if ok { // Error received from server.Run
+			slog.Error("Server exited prematurely", "error", err)
+			serverErr = err
+		} else { // serverErrChan was closed
+			slog.Info("Server goroutine completed its shutdown")
+		}
+	}
 
-	slog.Info("Shutdown signal received. Cleaning up...")
+	slog.Info("Starting graceful shutdown sequence")
 
-	// --- Gracefully stop the scheduler ---
-	// (Implement dataScheduler.Stop() if you added that to your scheduler for the ticker)
-	// For now, the scheduler's goroutine will exit when the main app exits.
-	// If you added the stopChan to the scheduler: dataScheduler.Stop()
+	slog.Info("Stopping scheduler")
+	if dataScheduler != nil {
+		dataScheduler.Stop()
+	}
+	slog.Info("Scheduler stopped")
 
-	// The server.Run function's graceful shutdown (which we need to add to server.go)
-	// will be handled there. If not, you'd call srv.Shutdown(ctx) here.
-	// For now, this main will exit, and Docker will restart the container based on restart policy.
-	// A more robust graceful shutdown for the HTTP server itself would be handled within server.Run or here.
+	// The server.Run function handles its own http.Server.Shutdown.
+	// We wait for the serverErrChan to know its status or rely on OS signal propagation.
+
+	slog.Info("Closing Redis connection")
+	if rdb != nil {
+		if err := rdb.Close(); err != nil {
+			slog.Error("Failed to close Redis connection", "error", err)
+		} else {
+			slog.Info("Redis connection closed")
+		}
+	}
 
 	if serverErr != nil {
-		slog.Error("Exiting due to server error.", "error", serverErr)
+		slog.Error("Application exited due to server error", "error", serverErr)
 		os.Exit(1)
 	}
-	slog.Info("Application shut down gracefully.")
+	slog.Info("Application shut down gracefully")
 }

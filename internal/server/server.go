@@ -1,4 +1,3 @@
-// internal/server/server.go
 package server
 
 import (
@@ -11,32 +10,21 @@ import (
 	"syscall"
 	"time"
 
-	// Adjust import paths
-	"github.com/ShawnEdgell/modio-api-go/internal/cache"
 	"github.com/ShawnEdgell/modio-api-go/internal/config"
+	"github.com/ShawnEdgell/modio-api-go/internal/repository"
 )
 
-// Run starts the HTTP server.
-func Run(cfg *config.AppConfig, cacheStore *cache.Store) error {
-	router := NewRouter(cacheStore) // Get the router with handlers
-
-	// Apply logging middleware (optional, from your http-go example)
-	// You would define loggingMiddleware similar to how it was in your http-go project,
-	// perhaps in this package or a shared middleware package.
-	// For now, let's keep it simple and not add it here to reduce complexity,
-	// but you can easily integrate it.
-	// loggedRouter := loggingMiddleware(router) 
+func Run(cfg *config.AppConfig, modRepo *repository.ModRepository) error { 
+	router := NewRouter(modRepo) 
 
 	srv := &http.Server{
-		Addr:    ":" + cfg.ServerPort,
-		Handler: router, // Use router here, or loggedRouter if you add middleware
-		// Good practice: set timeouts to avoid Slowloris attacks.
+		Addr:         ":" + cfg.ServerPort,
+		Handler:      router,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Goroutine for graceful shutdown
 	go func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -52,7 +40,7 @@ func Run(cfg *config.AppConfig, cacheStore *cache.Store) error {
 		}
 	}()
 
-	slog.Info("HTTP server starting", "port", cfg.ServerPort, "timestamp", time.Now().Format(time.RFC3339Nano))
+	slog.Info("HTTP server starting", "port", cfg.ServerPort)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("could not listen on %s: %w", ":"+cfg.ServerPort, err)
 	}

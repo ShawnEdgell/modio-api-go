@@ -1,35 +1,43 @@
-// internal/server/router.go
 package server
 
 import (
+	"log/slog"
 	"net/http"
+	"time"
 
-	// Adjust import paths
-	"github.com/ShawnEdgell/modio-api-go/internal/cache"
+	"github.com/ShawnEdgell/modio-api-go/internal/modio"
+	"github.com/ShawnEdgell/modio-api-go/internal/repository"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	slogchi "github.com/samber/slog-chi"
 )
 
-// NewRouter creates and configures a new HTTP router (ServeMux).
-func NewRouter(cacheStore *cache.Store) *http.ServeMux {
-	mux := http.NewServeMux()
+func NewRouter(modRepo *repository.ModRepository) *chi.Mux {
+	r := chi.NewRouter()
 
-	// API routes
-	mux.HandleFunc("/api/v1/skaterxl/maps", MapsHandler(cacheStore))
-	mux.HandleFunc("/api/v1/skaterxl/scripts", ScriptsHandler(cacheStore)) // Or /mods if you prefer
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	// Replace chi's default logger with slog-chi
+	// It will use the slog.Default() logger configured in your main.go
+	r.Use(slogchi.New(slog.Default()))
+	r.Use(middleware.Recoverer) // Recoverer should generally be after the logger
+	r.Use(middleware.Timeout(60 * time.Second))
 
-	// Health check route
-	mux.HandleFunc("/health", HealthCheckHandler())
+	r.Get("/api/v1/skaterxl/maps", MapsHandler(modRepo))
+	r.Get("/api/v1/skaterxl/scripts", ScriptsHandler(modRepo))
 
-	// Simple root redirect or message
-    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        if r.URL.Path != "/" { // Basic 404 for anything else not matched
-            http.NotFound(w, r)
-            return
-        }
-        http.Redirect(w, r, "https://www.skatebit.app", http.StatusMovedPermanently)
-        // Or just a message:
-        // fmt.Fprintf(w, "Mod.io Cache API for SkaterXL is running. See /api/v1/skaterxl/maps or /api/v1/skaterxl/scripts")
-    })
+	r.Get("/api/v1/skaterxl/maps/autocomplete", AutocompleteHandler(modRepo, modio.MapTag))
+	r.Get("/api/v1/skaterxl/scripts/autocomplete", AutocompleteHandler(modRepo, modio.ScriptModTag))
 
+	r.Get("/health", HealthCheckHandler(modRepo))
 
-	return mux
+	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "https://www.skatebit.app", http.StatusMovedPermanently)
+	})
+
+	return r
 }

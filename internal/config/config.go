@@ -9,22 +9,32 @@ import (
 )
 
 type AppConfig struct {
-	ServerPort                 string
-	ModioAPIKey                string
-	ModioGameID                string
-	ModioAPIDomain             string
-	CacheRefreshInterval       time.Duration
-	LightweightCheckInterval time.Duration // New field
+	ServerPort               string
+	ModioAPIKey              string
+	ModioGameID              string
+	ModioAPIDomain           string
+	CacheRefreshInterval     time.Duration
+	LightweightCheckInterval time.Duration
+
+	// --- New Redis Config ---
+	RedisAddr     string
+	RedisPassword string // Leave empty if no password
+	RedisDB       int    // Default is 0
 }
 
 func Load() *AppConfig {
 	cfg := &AppConfig{
 		ServerPort:               getEnv("PORT", "8000"),
-		ModioAPIKey:              os.Getenv("MODIO_API_KEY"),
-		ModioGameID:              getEnv("MODIO_GAME_ID", "629"),
-		ModioAPIDomain:           getEnv("MODIO_API_DOMAIN", "g-9677.modapi.io"),
-		CacheRefreshInterval:     getEnvAsDuration("CACHE_REFRESH_INTERVAL_HOURS", 6*time.Hour),
-		LightweightCheckInterval: getEnvAsDurationMinutes("LIGHTWEIGHT_CHECK_INTERVAL_MINUTES", 30*time.Minute), // New: default to 30 mins
+		ModioAPIKey:              os.Getenv("MODIO_API_KEY"), // Critical: No default
+		ModioGameID:              getEnv("MODIO_GAME_ID", "629"), // SkaterXL Game ID
+		ModioAPIDomain:           getEnv("MODIO_API_DOMAIN", "api.mod.io"), // Official domain
+		CacheRefreshInterval:     getEnvAsDurationHours("CACHE_REFRESH_INTERVAL_HOURS", 6*time.Hour),
+		LightweightCheckInterval: getEnvAsDurationMinutes("LIGHTWEIGHT_CHECK_INTERVAL_MINUTES", 15*time.Minute), // Check more frequently
+
+		// --- Load Redis Config ---
+		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword: getEnv("REDIS_PASSWORD", ""), // Default to no password
+		RedisDB:       getEnvAsInt("REDIS_DB", 0),   // Default to DB 0
 	}
 
 	if cfg.ModioAPIKey == "" {
@@ -40,8 +50,7 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// Renamed for clarity for hours
-func getEnvAsDuration(key string, fallback time.Duration) time.Duration {
+func getEnvAsDurationHours(key string, fallback time.Duration) time.Duration { // Renamed from getEnvAsDuration
 	strValue := getEnv(key, "")
 	if strValue != "" {
 		if hours, err := strconv.Atoi(strValue); err == nil {
@@ -56,7 +65,6 @@ func getEnvAsDuration(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-// New helper function for minutes
 func getEnvAsDurationMinutes(key string, fallback time.Duration) time.Duration {
 	strValue := getEnv(key, "")
 	if strValue != "" {
@@ -68,6 +76,17 @@ func getEnvAsDurationMinutes(key string, fallback time.Duration) time.Duration {
 		} else {
 			log.Printf("Warning: Invalid integer format for %s (minutes): %s. Using default.", key, strValue)
 		}
+	}
+	return fallback
+}
+
+func getEnvAsInt(key string, fallback int) int {
+	strValue := getEnv(key, "")
+	if strValue != "" {
+		if intVal, err := strconv.Atoi(strValue); err == nil {
+			return intVal
+		}
+		log.Printf("Warning: Invalid integer format for %s: %s. Using default.", key, strValue)
 	}
 	return fallback
 }

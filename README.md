@@ -1,76 +1,69 @@
-# Mod.io Cache API for SkaterXL (Go & Dockerized)
+# Mod.io API Cache for SkaterXL (Go, Redis & Dockerized)
 
-A self-hosted Go API that fetches Skater XL mod and map data from Mod.io, caches it in memory, and serves it via a JSON API. Features scheduled cache refreshes. Designed for containerized deployment.
+A self-hosted Go API that fetches Skater XL mod/map data from Mod.io, caches it in Redis, and serves it via JSON. Uses an event-driven mechanism for updates and periodic full syncs.
 
-## Key Technologies
+## Core Technologies
 
-- Go (net/http, log/slog)
-- Mod.io API
-- Docker & Docker Compose
-- Caddy (as reverse proxy for deployment)
+- Go (net/http, slog, go-chi/chi)
+- Redis
+- Mod.io API (Events API)
+- Docker
 
-## Deployed API (Target)
+## Quick Start (Local Docker)
 
-Once deployed, the API will be accessible at a URL like:
-`https://api.skatebit.app`
+**Prerequisites:** Docker, Git, `.env` file (from `.env.example`) with `MODIO_API_KEY`.
 
-## Quick Start / Local Development (Docker)
-
-**Prerequisites:**
-
-- Docker Desktop (or Docker Engine)
-- Git
-- A `.env` file created from `.env.example` with your `MODIO_API_KEY`.
-
-**Steps:**
-
-1.  Clone the repository:
+1.  **Clone:** `git clone <your_repo_url> && cd modio-api-go`
+2.  **Setup `.env`:** Copy `.env.example` to `.env`, add your `MODIO_API_KEY`.
+3.  **Run Redis (if not already running):**
     ```bash
-    git clone [https://github.com/ShawnEdgell/modio-api-go.git](https://github.com/ShawnEdgell/modio-api-go.git) # Replace with your repo URL
-    cd modio-api-go
+    docker run -d --name local-redis -p 6379:6379 redis:alpine
     ```
-2.  Create your `.env` file (copy from `.env.example`) and add your `MODIO_API_KEY` and set `PORT=8000`.
-3.  Build the Docker image:
+4.  **Build API Image:**
     ```bash
     docker build -t modio-api-go-local .
     ```
-4.  Run the container (maps host port 8083 to container port 8000):
+5.  **Run API Container:**
     ```bash
-    docker run -d -p 8083:8000 --env-file .env --name test-modio-api modio-api-go-local
+    docker run -d -p 8080:8000 \
+      --name test-modio-api \
+      -e PORT="8000" \
+      -e MODIO_API_KEY="your_modio_api_key" \
+      -e REDIS_ADDR="host.docker.internal:6379" \
+      modio-api-go-local
     ```
-5.  Access locally at `http://localhost:8083`. For example: `http://localhost:8083/api/v1/skaterxl/maps`.
+    (Adjust `8080` if that host port is taken. Use `host.docker.internal` for `REDIS_ADDR` on Docker Desktop; for Linux, use a shared Docker network and the Redis container name, e.g., `redis:6379`).
+6.  **Access:** `http://localhost:8080/api/v1/skaterxl/maps`
 
-_(For native Go development: ensure Go is installed, set environment variables, then `go mod tidy && go run .`)_
+## Key API Endpoints
 
-## API Endpoints
+- `GET /health`: Health check (includes Redis).
+- `GET /api/v1/skaterxl/maps`: Get Skater XL maps.
+- `GET /api/v1/skaterxl/scripts`: Get Skater XL script mods.
+- `GET /api/v1/skaterxl/maps/autocomplete?prefix={p}`: Autocomplete map titles.
+- `GET /api/v1/skaterxl/scripts/autocomplete?prefix={p}`: Autocomplete script titles.
 
-- `GET /health`: Health check.
-- `GET /api/v1/skaterxl/maps`: Returns cached Skater XL maps.
-- `GET /api/v1/skaterxl/scripts`: Returns cached Skater XL script mods.
-- `GET /`: Redirects to `https://www.skatebit.app` (or an API status message).
+## Essential Environment Variables
 
-_(Responses include `itemType`, `lastUpdated`, `count`, and `items` array.)_
+(See `.env.example` for all variables and defaults)
 
-## Environment Variables
-
-Configure via a `.env` file (see `.env.example`):
-
-- `MODIO_API_KEY` (Required): Your Mod.io API key.
-- `PORT`: Internal port the Go application listens on (default: `8000`).
-- `CACHE_REFRESH_INTERVAL_HOURS`: Defaults to `6`.
-- `MODIO_GAME_ID`: Defaults to `629`.
-- `MODIO_API_DOMAIN`: Defaults to `g-9677.modapi.io`.
+- `MODIO_API_KEY`: **Required**.
+- `PORT`: Internal port for the Go app (default: `8000`).
+- `REDIS_ADDR`: Redis server address (default: `localhost:6379`).
+- `LIGHTWEIGHT_CHECK_INTERVAL_MINUTES`: Event polling interval (default: `15`).
+- `CACHE_REFRESH_INTERVAL_HOURS`: Full sync interval (default: `6`).
 
 ## Deployment
 
-Deployed on a VPS using Docker. The application is containerized with the `Dockerfile` in this project and managed by a central `docker-compose.yml` on the server. Caddy serves as the reverse proxy, providing HTTPS.
+Containerize using the provided `Dockerfile`. Deploy on a VPS using Docker, ideally with Docker Compose to manage the API and Redis services. Use a reverse proxy (e.g., Caddy, Nginx) for HTTPS.
 
-## Key Project Files
+## Project Structure Highlights
 
-- `main.go`: Application entry point.
-- `internal/`: Contains core application packages (config, modio client, cache, scheduler, HTTP server).
-- `go.mod`, `go.sum`: Go module files.
-- `Dockerfile`: For building the application's Docker image.
-- `.dockerignore`: Specifies files to ignore during Docker build.
-- `.env.example`: Template for required environment variables.
-- `README.md`: This file.
+- `main.go`: Entry point.
+- `internal/`:
+  - `config/`: Environment configuration.
+  - `modio/`: Mod.io API client & types.
+  - `repository/`: Redis data operations.
+  - `scheduler/`: Data sync logic.
+  - `server/`: HTTP server, routing, handlers.
+- `Dockerfile`: Builds the production image.

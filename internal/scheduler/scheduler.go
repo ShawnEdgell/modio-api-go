@@ -1,175 +1,394 @@
-// internal/scheduler/scheduler.go
 package scheduler
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
-	"sync" // Import sync package for Mutex
+	"strconv"
+	"sync"
 	"time"
 
-	"github.com/ShawnEdgell/modio-api-go/internal/cache"
 	"github.com/ShawnEdgell/modio-api-go/internal/config"
 	"github.com/ShawnEdgell/modio-api-go/internal/modio"
+	"github.com/ShawnEdgell/modio-api-go/internal/repository" // Ensure this path is correct
 )
 
 const (
+	modEventsPageLimit       = 100
 	mapPageCountSafeguard    = 25
 	scriptPageCountSafeguard = 15
-	mapTag                   = "Map"
-	scriptModTag             = "Script"
-	lightweightCheckPageSize = 5 // How many items to fetch for the first page check
 )
 
 type Scheduler struct {
-	modioClient  *modio.Client
-	cacheStore   *cache.Store
-	cfg          *config.AppConfig
-	stopChan     chan struct{}
-	updateMu     sync.Mutex // Mutex to prevent concurrent full updates
-	isUpdating   bool       // Flag to indicate if a full update is in progress
+	modioClient *modio.Client
+	modRepo     *repository.ModRepository
+	cfg         *config.AppConfig
+	stopChan    chan struct{}
+	updateMu    sync.Mutex
 }
 
-func NewScheduler(client *modio.Client, store *cache.Store, cfg *config.AppConfig) *Scheduler {
+func NewScheduler(client *modio.Client, repo *repository.ModRepository, cfg *config.AppConfig) *Scheduler {
 	return &Scheduler{
 		modioClient: client,
-		cacheStore:  store,
+		modRepo:     repo,
 		cfg:         cfg,
 		stopChan:    make(chan struct{}),
 	}
 }
 
-// runUpdate performs a full data refresh
-func (s *Scheduler) runUpdate(triggeredBy string) {
+func (s *Scheduler) processRecentChangesViaEvents(ctx context.Context, triggeredBy string) {
 	if !s.updateMu.TryLock() {
-		slog.Info("Scheduler: Full update already in progress, skipping new trigger.", "triggered_by", triggeredBy)
+		slog.Info("Scheduler: Event processing or full sync already in progress, skipping.", "triggered_by", triggeredBy)
 		return
 	}
-	s.isUpdating = true
-	defer func() {
-		s.isUpdating = false
-		s.updateMu.Unlock()
-	}()
+	slog.Info("Scheduler: Starting event processing cycle.", "triggered_by", triggeredBy)
+	defer s.updateMu.Unlock()
 
-	slog.Info("Scheduler: Starting data refresh cycle.", "triggered_by", triggeredBy)
-
-	var fetchedMaps, fetchedScripts []modio.Mod
-	var errMaps, errScripts error
-
-	slog.Info("Scheduler: Fetching maps...", "safeguard_max_pages", mapPageCountSafeguard)
-	fetchedMaps, errMaps = s.modioClient.FetchAllItems(mapTag, mapPageCountSafeguard)
-	if errMaps != nil {
-		slog.Error("Scheduler: Failed to fetch maps from Mod.io", "error", errMaps)
-	} else {
-		slog.Info("Scheduler: Successfully fetched maps", "count", len(fetchedMaps))
+	lastSyncEventTs, err := s.modRepo.GetSchedulerLastSyncEventTimestamp(ctx)
+	if err != nil {
+		slog.Error("Scheduler (Events): Failed to get last sync event timestamp from repository. Aborting event processing.", "error", err)
+		return
+	}
+	if lastSyncEventTs == 0 {
+		slog.Info("Scheduler (Events): No last sync event timestamp found. Initial full sync recommended or seed timestamp.")
 	}
 
-	slog.Info("Scheduler: Fetching script mods...", "safeguard_max_pages", scriptPageCountSafeguard)
-	fetchedScripts, errScripts = s.modioClient.FetchAllItems(scriptModTag, scriptPageCountSafeguard)
-	if errScripts != nil {
-		slog.Error("Scheduler: Failed to fetch script mods from Mod.io", "error", errScripts)
-	} else {
-		slog.Info("Scheduler: Successfully fetched script mods", "count", len(fetchedScripts))
+	slog.Info("Scheduler (Events): Fetching new mod events from Mod.io", "since_timestamp", lastSyncEventTs)
+
+	var allEventsToProcess []modio.ModioEvent
+	currentOffset := 0
+	maxEventsToProcessInOneCycle := 1000
+	totalEventsFetchedThisCycle := 0
+
+	for {
+		eventsResponse, err := s.modioClient.FetchModEvents(ctx, lastSyncEventTs, currentOffset, modEventsPageLimit)
+		if err != nil {
+			slog.Error("Scheduler (Events): Failed to fetch mod events page from Mod.io", "offset", currentOffset, "error", err)
+			break
+		}
+
+		if eventsResponse == nil || len(eventsResponse.Data) == 0 {
+			slog.Info("Scheduler (Events): No more new events found.", "total_fetched_this_page", 0)
+			break
+		}
+		slog.Info("Scheduler (Events): Fetched events page.", "count", len(eventsResponse.Data), "offset", currentOffset, "total_available", eventsResponse.ResultTotal)
+		allEventsToProcess = append(allEventsToProcess, eventsResponse.Data...)
+		totalEventsFetchedThisCycle += len(eventsResponse.Data)
+
+		if len(eventsResponse.Data) < modEventsPageLimit || totalEventsFetchedThisCycle >= eventsResponse.ResultTotal || totalEventsFetchedThisCycle >= maxEventsToProcessInOneCycle {
+			break
+		}
+		currentOffset += len(eventsResponse.Data)
+		
+		select {
+		case <-ctx.Done():
+			slog.Info("Scheduler (Events): Context cancelled during event pagination.")
+			return
+		case <-s.stopChan:
+			slog.Info("Scheduler (Events): Stop signal received during event pagination.")
+			return
+		default:
+		}
 	}
 
-	currentMaps, _ := s.cacheStore.GetMaps()
-	currentScripts, _ := s.cacheStore.GetScripts()
-	mapsToStore := currentMaps
-	scriptsToStore := currentScripts
-
-	if errMaps == nil {
-		slog.Info("Scheduler: Staging fetched maps for cache update.")
-		mapsToStore = fetchedMaps
-	} else {
-		slog.Warn("Scheduler: Maps fetch failed, keeping existing maps in cache.")
+	if len(allEventsToProcess) == 0 {
+		slog.Info("Scheduler (Events): No new events to process.")
+		if err := s.modRepo.SetLastOverallWriteTimestamp(ctx, time.Now().UTC()); err != nil {
+			slog.Error("Scheduler (Events): Failed to update last overall write timestamp after no events", "error", err)
+		}
+		return
 	}
 
-	if errScripts == nil {
-		slog.Info("Scheduler: Staging fetched scripts for cache update.")
-		scriptsToStore = fetchedScripts
-	} else {
-		slog.Warn("Scheduler: Scripts fetch failed, keeping existing scripts in cache.")
+	slog.Info("Scheduler (Events): Processing events.", "count", len(allEventsToProcess))
+	pipe := s.modRepo.Client().Pipeline() // Corrected: Use Client() method to get *redis.Client, then Pipeline()
+	var latestEventTsProcessedInBatch int64 = lastSyncEventTs
+
+	for _, event := range allEventsToProcess {
+		select {
+		case <-ctx.Done():
+			slog.Info("Scheduler (Events): Context cancelled during event processing loop.")
+			return
+		case <-s.stopChan:
+			slog.Info("Scheduler (Events): Stop signal received during event processing loop.")
+			return
+		default:
+		}
+
+		slog.Debug("Scheduler (Events): Processing event", "event_id", event.ID, "mod_id", event.ModID, "type", event.EventType, "date_added", event.DateAdded)
+		modTypeTag := ""
+
+		oldModData, err := s.modRepo.GetModByID(ctx, event.ModID)
+		if err != nil {
+			slog.Error("Scheduler (Events): Failed to get old mod data from repository for event processing", "mod_id", event.ModID, "event_type", event.EventType, "error", err)
+		}
+		if oldModData != nil {
+			isMap := false
+			isScript := false
+			for _, tag := range oldModData.Tags {
+				if tag.Name == modio.MapTag {
+					isMap = true
+					break
+				}
+				if tag.Name == modio.ScriptModTag {
+					isScript = true
+					break
+				}
+			}
+			if isMap {
+				modTypeTag = modio.MapTag
+			} else if isScript {
+				modTypeTag = modio.ScriptModTag
+			}
+		}
+
+		switch event.EventType {
+		case "MOD_DELETED", "MOD_UNAVAILABLE":
+			if oldModData != nil {
+				s.modRepo.AddRemoveModCommandsFromPipeline(ctx, pipe, oldModData, modTypeTag)
+				slog.Info("Scheduler (Events): Mod marked for deletion from repository", "mod_id", event.ModID, "event_type", event.EventType)
+			} else {
+				slog.Warn("Scheduler (Events): Mod to be deleted/unavailable not found in repository, or type unknown. Full sync will reconcile.", "mod_id", event.ModID)
+				pipe.Del(ctx, repository.ModKeyPrefix+strconv.Itoa(event.ModID)) // Corrected: Use exported ModKeyPrefix
+			}
+		case "MOD_AVAILABLE", "MOD_EDITED", "MODFILE_CHANGED":
+			newModData, err := s.modioClient.GetModDetails(ctx, event.ModID)
+			if err != nil {
+				slog.Error("Scheduler (Events): Failed to fetch updated mod details from Mod.io", "mod_id", event.ModID, "event_type", event.EventType, "error", err)
+				continue
+			}
+			if newModData == nil {
+				slog.Warn("Scheduler (Events): Mod details not found on Mod.io after update event, possibly became unavailable immediately.", "mod_id", event.ModID, "event_type", event.EventType)
+				if oldModData != nil {
+					s.modRepo.AddRemoveModCommandsFromPipeline(ctx, pipe, oldModData, modTypeTag)
+				} else {
+					pipe.Del(ctx, repository.ModKeyPrefix+strconv.Itoa(event.ModID)) // Corrected: Use exported ModKeyPrefix
+				}
+				continue
+			}
+			
+			isMapNew := false
+			isScriptNew := false
+			for _, tag := range newModData.Tags {
+				if tag.Name == modio.MapTag {
+					isMapNew = true; break
+				}
+				if tag.Name == modio.ScriptModTag {
+					isScriptNew = true; break
+				}
+			}
+			if isMapNew { modTypeTag = modio.MapTag } else if isScriptNew { modTypeTag = modio.ScriptModTag } else {
+				// If type cannot be determined from new tags, try to use old type if available
+				if modTypeTag == "" && oldModData != nil {
+					// modTypeTag would have been set from oldModData's tags
+				} else if modTypeTag == "" {
+					slog.Warn("Scheduler (Events): Could not determine mod type for new/updated mod, tag indexing may be incomplete", "mod_id", newModData.ID)
+					// Default to a generic or no type for indexing if necessary, or skip type-specific indexes
+				}
+			}
+
+
+			if oldModData != nil {
+				s.modRepo.RemoveOrphanedTagIndexEntries(ctx, pipe, oldModData, newModData, modTypeTag)
+			}
+			err = s.modRepo.AddModCommandsToPipeline(ctx, pipe, newModData, modTypeTag)
+			if err != nil {
+				slog.Error("Scheduler (Events): Error adding save commands to pipeline for mod", "mod_id", newModData.ID, "error", err)
+			} else {
+				slog.Info("Scheduler (Events): Mod marked for save/update in repository", "mod_id", newModData.ID, "event_type", event.EventType)
+			}
+		default:
+			slog.Debug("Scheduler (Events): Ignoring event type", "type", event.EventType, "mod_id", event.ModID)
+		}
+
+		if event.DateAdded > latestEventTsProcessedInBatch {
+			latestEventTsProcessedInBatch = event.DateAdded
+		}
 	}
 
-	s.cacheStore.Update(mapsToStore, scriptsToStore)
-	slog.Info("Scheduler: Data refresh cycle complete.", "triggered_by", triggeredBy, "last_updated", s.cacheStore.LastUpdated.Format(time.RFC3339))
+	if pipe.Len() > 0 { // Only execute if there are commands
+		if _, err := pipe.Exec(ctx); err != nil {
+			slog.Error("Scheduler (Events): Failed to execute Redis pipeline for event processing", "error", err)
+			return
+		}
+	}
+
+
+	if latestEventTsProcessedInBatch > lastSyncEventTs {
+		if err := s.modRepo.SetSchedulerLastSyncEventTimestamp(ctx, latestEventTsProcessedInBatch); err != nil {
+			slog.Error("Scheduler (Events): Failed to update last sync event timestamp in repository", "error", err)
+		} else {
+			slog.Info("Scheduler (Events): Successfully updated last sync event timestamp.", "timestamp", latestEventTsProcessedInBatch)
+		}
+	}
+	if err := s.modRepo.SetLastOverallWriteTimestamp(ctx, time.Now().UTC()); err != nil {
+		slog.Error("Scheduler (Events): Failed to update last overall write timestamp", "error", err)
+	}
+	slog.Info("Scheduler (Events): Event processing cycle finished.")
 }
 
-// runLightweightCheck fetches the first page of items and triggers a full update if changes are detected.
-func (s *Scheduler) runLightweightCheck() {
-	if s.isUpdating { // Don't start a lightweight check if a full update is already running
-		slog.Info("Scheduler: Full update in progress, skipping lightweight check.")
+func (s *Scheduler) runFullSynchronization(ctx context.Context, triggeredBy string) {
+	if !s.updateMu.TryLock() {
+		slog.Info("Scheduler: Full sync or event processing already in progress, skipping.", "triggered_by", triggeredBy)
 		return
 	}
-	slog.Info("Scheduler: Performing lightweight check for new Mod.io items...")
+	slog.Info("Scheduler (Full Sync): Starting full data synchronization.", "triggered_by", triggeredBy)
+	defer s.updateMu.Unlock()
 
-	needsMapUpdate := false
-	needsScriptUpdate := false
-
-	// Check Maps
-	currentMaps, _ := s.cacheStore.GetMaps()
-	newTopMapsPage, err := s.modioClient.FetchAllItems(mapTag, 1) // Fetch only first page (FetchAllItems will stop after 1 page if maxPagesToFetch is 1)
-                                                                // Or more directly: s.modioClient.fetchPage(mapTag, lightweightCheckPageSize, 0)
-	if err != nil {
-		slog.Error("Scheduler (Lightweight): Failed to fetch first page of maps", "error", err)
-	} else if len(newTopMapsPage) > 0 {
-		if len(currentMaps) == 0 || // If cache is empty
-			currentMaps[0].ID != newTopMapsPage[0].ID || // If top item ID changed
-			currentMaps[0].DateUpdated < newTopMapsPage[0].DateUpdated { // If top item is newer
-			slog.Info("Scheduler (Lightweight): Change detected in maps. Triggering full map update.")
-			needsMapUpdate = true
+	processType := func(itemTypeTag string, pageSafeguard int) (int64, error) { // Return max timestamp for this type
+		slog.Info("Scheduler (Full Sync): Fetching all items from Mod.io.", "type", itemTypeTag)
+		modsFromAPI, err := s.modioClient.FetchAllItems(ctx, itemTypeTag, pageSafeguard)
+		if err != nil {
+			return 0, fmt.Errorf("failed to fetch all %s from Mod.io: %w", itemTypeTag, err)
 		}
+		slog.Info("Scheduler (Full Sync): Successfully fetched items from Mod.io.", "type", itemTypeTag, "count", len(modsFromAPI))
+
+		modType := repository.GetModTypeFromTag(itemTypeTag) // Corrected: Use exported GetModTypeFromTag
+		idsInRepo, err := s.modRepo.GetAllModIDsByType(ctx, modType)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get all %s IDs from repository: %w", modType, err)
+		}
+		slog.Debug("Scheduler (Full Sync): Current IDs in repository.", "type", modType, "count", len(idsInRepo))
+
+		apiModIDs := make(map[string]bool)
+		for i := range modsFromAPI {
+			mod := &modsFromAPI[i]
+			apiModIDs[strconv.Itoa(mod.ID)] = true
+		}
+
+		pipe := s.modRepo.Client().Pipeline() // Corrected: Use Client() method
+		var maxModUpdateTimestampForThisType int64 = 0
+
+		for _, idInRepoStr := range idsInRepo {
+			if !apiModIDs[idInRepoStr] {
+				modID, _ := strconv.Atoi(idInRepoStr)
+				slog.Debug("Scheduler (Full Sync): Mod found in repository but not in API fetch, marking for deletion.", "type", modType, "mod_id", modID)
+				oldModData, err := s.modRepo.GetModByID(ctx, modID)
+				if err != nil {
+					slog.Error("Scheduler (Full Sync): Failed to get old mod data for deletion.", "mod_id", modID, "error", err)
+					pipe.Del(ctx, repository.ModKeyPrefix+idInRepoStr) // Corrected: Use exported ModKeyPrefix
+					continue
+				}
+				if oldModData != nil {
+					s.modRepo.AddRemoveModCommandsFromPipeline(ctx, pipe, oldModData, itemTypeTag)
+				} else {
+					pipe.Del(ctx, repository.ModKeyPrefix+idInRepoStr) // Corrected: Use exported ModKeyPrefix
+				}
+			}
+		}
+
+		for i := range modsFromAPI {
+			mod := &modsFromAPI[i] // Iterate by index to get addressable mod for pipeline
+			if mod.DateUpdated > maxModUpdateTimestampForThisType {
+				maxModUpdateTimestampForThisType = mod.DateUpdated
+			}
+			
+			oldModData, _ := s.modRepo.GetModByID(ctx, mod.ID)
+			if oldModData != nil {
+				s.modRepo.RemoveOrphanedTagIndexEntries(ctx, pipe, oldModData, mod, itemTypeTag)
+			}
+			
+			err := s.modRepo.AddModCommandsToPipeline(ctx, pipe, mod, itemTypeTag)
+			if err != nil {
+				slog.Error("Scheduler (Full Sync): Failed to add save commands for mod to pipeline.", "mod_id", mod.ID, "error", err)
+			}
+		}
+		
+		if pipe.Len() > 0 {
+			slog.Info("Scheduler (Full Sync): Executing Redis pipeline for type.", "type", itemTypeTag, "commands_in_pipe", pipe.Len())
+			if _, err := pipe.Exec(ctx); err != nil {
+				return 0, fmt.Errorf("failed to execute Redis pipeline for %s: %w", itemTypeTag, err)
+			}
+		}
+		slog.Info("Scheduler (Full Sync): Successfully synchronized type.", "type", itemTypeTag)
+		return maxModUpdateTimestampForThisType, nil
 	}
 
-	// Check Scripts
-	currentScripts, _ := s.cacheStore.GetScripts()
-	newTopScriptsPage, err := s.modioClient.FetchAllItems(scriptModTag, 1) // Fetch only first page
-	if err != nil {
-		slog.Error("Scheduler (Lightweight): Failed to fetch first page of scripts", "error", err)
-	} else if len(newTopScriptsPage) > 0 {
-		if len(currentScripts) == 0 || // If cache is empty
-			currentScripts[0].ID != newTopScriptsPage[0].ID || // If top item ID changed
-			currentScripts[0].DateUpdated < newTopScriptsPage[0].DateUpdated { // If top item is newer
-			slog.Info("Scheduler (Lightweight): Change detected in scripts. Triggering full script update.")
-			needsScriptUpdate = true
-		}
-	}
+	var overallMaxModUpdateTimestamp int64 = 0
+	
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, 10*time.Minute) // Increased timeout for full sync
+	defer cancel()
 
-	if needsMapUpdate || needsScriptUpdate {
-		// Call runUpdate in a new goroutine to avoid blocking the lightweight check ticker,
-		// and runUpdate now has its own lock to prevent concurrent full updates.
-		go s.runUpdate("triggered_by_lightweight_check")
+	maxTsMaps, errMaps := processType(modio.MapTag, mapPageCountSafeguard)
+	if errMaps != nil {
+		slog.Error("Scheduler (Full Sync): Error processing maps.", "error", errMaps)
 	} else {
-		slog.Info("Scheduler (Lightweight): No significant changes detected on first pages.")
+		if maxTsMaps > overallMaxModUpdateTimestamp {
+			overallMaxModUpdateTimestamp = maxTsMaps
+		}
 	}
+
+	maxTsScripts, errScripts := processType(modio.ScriptModTag, scriptPageCountSafeguard)
+	if errScripts != nil {
+		slog.Error("Scheduler (Full Sync): Error processing scripts.", "error", errScripts)
+	} else {
+		if maxTsScripts > overallMaxModUpdateTimestamp {
+			overallMaxModUpdateTimestamp = maxTsScripts
+		}
+	}
+
+	if errMaps == nil && errScripts == nil {
+		slog.Info("Scheduler (Full Sync): Both maps and scripts processed. Updating timestamps.")
+		if overallMaxModUpdateTimestamp > 0 {
+			if err := s.modRepo.SetSchedulerLastSyncEventTimestamp(ctxWithTimeout, overallMaxModUpdateTimestamp); err != nil {
+				slog.Error("Scheduler (Full Sync): Failed to update last sync event timestamp after full sync.", "error", err)
+			} else {
+				slog.Info("Scheduler (Full Sync): Updated last sync event timestamp after full sync.", "timestamp", overallMaxModUpdateTimestamp)
+			}
+		}
+	} else {
+		slog.Warn("Scheduler (Full Sync): One or more types failed to process during full sync. Timestamps might not be fully updated.")
+	}
+	
+	if err := s.modRepo.SetLastOverallWriteTimestamp(ctxWithTimeout, time.Now().UTC()); err != nil {
+		slog.Error("Scheduler (Full Sync): Failed to update last overall write timestamp.", "error", err)
+	}
+
+	slog.Info("Scheduler (Full Sync): Full data synchronization cycle finished.")
 }
 
 func (s *Scheduler) Start() {
 	slog.Info("Starting Mod.io data scheduler...",
-		"full_refresh_interval", s.cfg.CacheRefreshInterval.String(),
-		"lightweight_check_interval", s.cfg.LightweightCheckInterval.String(),
+		"event_processing_interval", s.cfg.LightweightCheckInterval.String(),
+		"full_sync_interval", s.cfg.CacheRefreshInterval.String(),
 	)
+	
+	baseCtx, cancelAll := context.WithCancel(context.Background()) 
+	// Store cancelAll if you want to trigger a shutdown of these goroutines from Stop more directly
+	// For now, stopChan handles ticker goroutine, and updateMu prevents new long tasks.
 
-	// Perform an initial full update immediately
 	go func() {
-		slog.Info("Scheduler: Performing initial data load.")
-		s.runUpdate("initial_startup")
+		slog.Info("Scheduler: Performing initial full data synchronization.")
+		// Use a specific context for this initial task that can be shorter if needed
+		initialSyncCtx, initialSyncCancel := context.WithTimeout(baseCtx, 15*time.Minute) // Timeout for initial sync
+		defer initialSyncCancel()
+		s.runFullSynchronization(initialSyncCtx, "initial_startup")
 	}()
 
-	fullRefreshTicker := time.NewTicker(s.cfg.CacheRefreshInterval)
-	lightweightCheckTicker := time.NewTicker(s.cfg.LightweightCheckInterval)
+	eventProcessingTicker := time.NewTicker(s.cfg.LightweightCheckInterval)
+	fullSyncTicker := time.NewTicker(s.cfg.CacheRefreshInterval)
 
 	go func() {
-		defer fullRefreshTicker.Stop()
-		defer lightweightCheckTicker.Stop()
+		defer slog.Info("Scheduler: Ticker goroutine stopped.")
+		defer eventProcessingTicker.Stop()
+		defer fullSyncTicker.Stop()
+
 		for {
 			select {
-			case <-fullRefreshTicker.C:
-				slog.Info("Scheduler: Full refresh tick received.")
-				s.runUpdate("scheduled_full_refresh")
-			case <-lightweightCheckTicker.C:
-				slog.Info("Scheduler: Lightweight check tick received.")
-				s.runLightweightCheck()
+			case <-eventProcessingTicker.C:
+				slog.Info("Scheduler: Event processing tick received.")
+				// Use a specific context for each event processing cycle
+				eventCtx, eventCancel := context.WithTimeout(baseCtx, 5*time.Minute) // Timeout for one event cycle
+				s.processRecentChangesViaEvents(eventCtx, "scheduled_event_processing")
+				eventCancel()
+			case <-fullSyncTicker.C:
+				slog.Info("Scheduler: Full synchronization tick received.")
+				// Use a specific context for each full sync cycle
+				fullSyncCtx, fullSyncCancel := context.WithTimeout(baseCtx, 30*time.Minute) // Timeout for one full sync cycle
+				s.runFullSynchronization(fullSyncCtx, "scheduled_full_sync")
+				fullSyncCancel()
 			case <-s.stopChan:
-				slog.Info("Scheduler: Stop signal received, stopping all tickers.")
+				slog.Info("Scheduler: Stop signal received, cancelling base context and exiting ticker goroutine.")
+				cancelAll() // Cancel baseCtx to signal running tasks
 				return
 			}
 		}
@@ -177,12 +396,18 @@ func (s *Scheduler) Start() {
 }
 
 func (s *Scheduler) Stop() {
-	slog.Info("Scheduler: Attempting to stop scheduler...")
+	slog.Info("Scheduler: Attempting to stop...")
+	if s.stopChan == nil {
+		slog.Warn("Scheduler: stopChan is nil.")
+		return
+	}
 	select {
 	case <-s.stopChan:
-		slog.Warn("Scheduler: Stop channel already closed or stop initiated.")
+		slog.Warn("Scheduler: Stop channel already closed.")
 	default:
-		close(s.stopChan)
-		slog.Info("Scheduler: Stop signal sent.")
+		close(s.stopChan) // This signals the main ticker goroutine to stop
+		slog.Info("Scheduler: Stop signal sent to ticker goroutine.")
 	}
+	// Note: updateMu will prevent new long operations from starting.
+	// Ongoing operations (event processing or full sync) will complete or timeout based on their own contexts.
 }
